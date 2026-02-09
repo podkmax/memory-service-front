@@ -1,4 +1,6 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { useParams } from "react-router-dom";
 import { ApiClientError, toUiErrorMessage } from "../api/client";
 import {
@@ -11,6 +13,8 @@ import { StatusBadge } from "../components/StatusBadge";
 import type { ArtifactResponse } from "../types";
 
 const presets = [4000, 10000, 50000] as const;
+const hugeMaxContentLength = 200000;
+type ContentMode = "markdown" | "raw";
 
 export function ArtifactDetailPage() {
   const params = useParams();
@@ -20,6 +24,9 @@ export function ArtifactDetailPage() {
   const [changingStatus, setChangingStatus] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [autoLoadingFullContent, setAutoLoadingFullContent] = useState(false);
+  const [stillTruncatedAfterAutoLoad, setStillTruncatedAfterAutoLoad] = useState(false);
+  const [contentMode, setContentMode] = useState<ContentMode>("markdown");
 
   const [maxContentLength, setMaxContentLength] = useState("4000");
   const [customLength, setCustomLength] = useState("");
@@ -28,6 +35,7 @@ export function ArtifactDetailPage() {
   const [editContent, setEditContent] = useState("");
 
   const isDraft = artifact?.status === "DRAFT";
+  const canEdit = isDraft && contentMode === "raw";
 
   const parsedArtifactId = useMemo(() => Number(params.id), [params.id]);
 
@@ -37,19 +45,35 @@ export function ArtifactDetailPage() {
       setLoading(false);
       return;
     }
-    void loadArtifact(parsedArtifactId, Number(maxContentLength));
+    void loadArtifact(parsedArtifactId, Number(maxContentLength), false);
   }, [parsedArtifactId]);
 
-  async function loadArtifact(id: number, length?: number) {
+  async function loadArtifact(id: number, length?: number, skipAutoLoad = false) {
     setLoading(true);
     setError(null);
     setSuccess(null);
+    setStillTruncatedAfterAutoLoad(false);
     try {
       const data = await getArtifact(id, length);
-      setArtifact(data);
-      setEditType(data.type);
-      setEditTitle(data.title);
-      setEditContent(data.content);
+      let effective = data;
+
+      if (!skipAutoLoad && data.contentTruncated) {
+        setAutoLoadingFullContent(true);
+        try {
+          const full = await getArtifact(id, hugeMaxContentLength);
+          effective = full;
+          if (full.contentTruncated) {
+            setStillTruncatedAfterAutoLoad(true);
+          }
+        } finally {
+          setAutoLoadingFullContent(false);
+        }
+      }
+
+      setArtifact(effective);
+      setEditType(effective.type);
+      setEditTitle(effective.title);
+      setEditContent(effective.content);
     } catch (err) {
       setError(toUiErrorMessage(err));
     } finally {
@@ -63,7 +87,11 @@ export function ArtifactDetailPage() {
       return;
     }
     const parsed = Number(maxContentLength);
-    await loadArtifact(artifact.id, Number.isFinite(parsed) && parsed > 0 ? parsed : undefined);
+    await loadArtifact(
+      artifact.id,
+      Number.isFinite(parsed) && parsed > 0 ? parsed : undefined,
+      true,
+    );
   }
 
   function onSelectPreset(value: string) {
@@ -76,7 +104,7 @@ export function ArtifactDetailPage() {
 
   async function onSave(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!artifact || !isDraft) {
+    if (!artifact || !canEdit) {
       return;
     }
 
@@ -104,14 +132,27 @@ export function ArtifactDetailPage() {
     setSuccess(null);
     try {
       const updated = await patchArtifact(artifact.id, payload, Number(maxContentLength));
-      setArtifact(updated);
-      setEditType(updated.type);
-      setEditTitle(updated.title);
-      setEditContent(updated.content);
+      let effective = updated;
+      if (updated.contentTruncated) {
+        setAutoLoadingFullContent(true);
+        try {
+          const full = await getArtifact(updated.id, hugeMaxContentLength);
+          effective = full;
+          if (full.contentTruncated) {
+            setStillTruncatedAfterAutoLoad(true);
+          }
+        } finally {
+          setAutoLoadingFullContent(false);
+        }
+      }
+      setArtifact(effective);
+      setEditType(effective.type);
+      setEditTitle(effective.title);
+      setEditContent(effective.content);
       setSuccess("Artifact updated.");
     } catch (err) {
       if (err instanceof ApiClientError && err.status === 409) {
-        setError("Update conflict: only DRAFT artifacts can be edited. Reload artifact state.");
+        setError("Редактирование доступно только для DRAFT");
       } else {
         setError(toUiErrorMessage(err));
       }
@@ -135,7 +176,7 @@ export function ArtifactDetailPage() {
       } else {
         await deprecateArtifact(artifact.id, Number(maxContentLength));
       }
-      await loadArtifact(artifact.id, Number(maxContentLength));
+      await loadArtifact(artifact.id, Number(maxContentLength), false);
       setSuccess(target === "approve" ? "Artifact approved." : "Artifact deprecated.");
     } catch (err) {
       setError(toUiErrorMessage(err));
@@ -174,43 +215,89 @@ export function ArtifactDetailPage() {
               </span>
             </div>
 
-            <form className="inline-form" onSubmit={onLoadMore}>
-              <label>
-                maxContentLength
-                <select
-                  value={presets.includes(Number(maxContentLength) as (typeof presets)[number]) ? maxContentLength : "custom"}
-                  onChange={(event) => onSelectPreset(event.target.value)}
-                >
-                  {presets.map((value) => (
-                    <option key={value} value={String(value)}>
-                      {value}
-                    </option>
-                  ))}
-                  <option value="custom">Custom</option>
-                </select>
-              </label>
-              <input
-                type="number"
-                min={1}
-                placeholder="Custom"
-                value={customLength}
-                onChange={(event) => {
-                  setCustomLength(event.target.value);
-                  if (event.target.value) {
-                    setMaxContentLength(event.target.value);
-                  }
-                }}
-              />
-              <button type="submit">Load</button>
-            </form>
+            {autoLoadingFullContent && (
+              <p className="info">Loading full content automatically...</p>
+            )}
+            {stillTruncatedAfterAutoLoad && (
+              <p className="alert error">
+                Content is still truncated after automatic full-load attempt. Use Advanced settings to request larger content.
+              </p>
+            )}
 
-            <pre className="content-view">{artifact.content}</pre>
+            <div className="content-mode-switch" role="tablist" aria-label="Content mode">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={contentMode === "markdown"}
+                className={contentMode === "markdown" ? "mode-tab active" : "mode-tab"}
+                onClick={() => setContentMode("markdown")}
+              >
+                Markdown
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={contentMode === "raw"}
+                className={contentMode === "raw" ? "mode-tab active" : "mode-tab"}
+                onClick={() => setContentMode("raw")}
+              >
+                Raw
+              </button>
+            </div>
+
+            {contentMode === "markdown" ? (
+              <div className="markdown-view">
+                <Markdown remarkPlugins={[remarkGfm]} skipHtml>
+                  {artifact.content}
+                </Markdown>
+              </div>
+            ) : (
+              <pre className="content-view">{artifact.content}</pre>
+            )}
+
+            <details className="advanced-panel">
+              <summary>Advanced maxContentLength</summary>
+              <form className="inline-form" onSubmit={onLoadMore}>
+                <label>
+                  maxContentLength
+                  <select
+                    value={
+                      presets.includes(Number(maxContentLength) as (typeof presets)[number])
+                        ? maxContentLength
+                        : "custom"
+                    }
+                    onChange={(event) => onSelectPreset(event.target.value)}
+                  >
+                    {presets.map((value) => (
+                      <option key={value} value={String(value)}>
+                        {value}
+                      </option>
+                    ))}
+                    <option value="custom">Custom</option>
+                  </select>
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  placeholder="Custom"
+                  value={customLength}
+                  onChange={(event) => {
+                    setCustomLength(event.target.value);
+                    if (event.target.value) {
+                      setMaxContentLength(event.target.value);
+                    }
+                  }}
+                />
+                <button type="submit">Load</button>
+              </form>
+            </details>
           </article>
 
           <form className="card stacked" onSubmit={onSave}>
             <h3>Edit artifact</h3>
-            {!isDraft && (
-              <p className="info">Editing is disabled because this artifact is not in DRAFT status.</p>
+            {!isDraft && <p className="info">Editing is disabled because this artifact is not in DRAFT status.</p>}
+            {isDraft && contentMode !== "raw" && (
+              <p className="info">Switch to Raw mode to edit artifact content.</p>
             )}
 
             <div className="form-grid split">
@@ -219,7 +306,7 @@ export function ArtifactDetailPage() {
                 <input
                   value={editType}
                   onChange={(event) => setEditType(event.target.value)}
-                  disabled={!isDraft}
+                  disabled={!canEdit}
                 />
               </label>
               <label>
@@ -227,7 +314,7 @@ export function ArtifactDetailPage() {
                 <input
                   value={editTitle}
                   onChange={(event) => setEditTitle(event.target.value)}
-                  disabled={!isDraft}
+                  disabled={!canEdit}
                 />
               </label>
             </div>
@@ -238,11 +325,11 @@ export function ArtifactDetailPage() {
                 value={editContent}
                 onChange={(event) => setEditContent(event.target.value)}
                 rows={10}
-                disabled={!isDraft}
+                disabled={!canEdit}
               />
             </label>
 
-            <button type="submit" disabled={!isDraft || saving}>
+            <button type="submit" disabled={!canEdit || saving}>
               {saving ? "Saving..." : "Save changes"}
             </button>
           </form>
